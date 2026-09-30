@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>游客页 · 已发布展签</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="topbar">
+  <h1>展馆展签 · 多语版本</h1>
+  <div class="spacer"></div>
+  <a href="/login" class="muted">馆员 / 译者 / 校对登录</a>
+</div>
+<div class="container">
+  <div id="content" class="muted">正在加载…</div>
+</div>
+<script>
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+async function load() {
+  const langs = await fetch('/api/public/languages').then((r) => r.json());
+  const html = langs.map((lang) => {
+    if (!lang.published) {
+      return `<div class="card visitor-lang">
+        <h2>${esc(lang.language.name)} <span class="muted">${esc(lang.language.code)}</span></h2>
+        <div class="visitor-empty">该语言暂无已发布内容。</div>
+      </div>`;
+    }
+    return `<div class="card visitor-lang">
+      <h2>${esc(lang.language.name)} <span class="muted">${esc(lang.language.code)}</span></h2>
+      <div class="snap-meta">
+        最新版本 v${lang.version} · 发布于 ${esc(lang.published_at)}
+      </div>
+      ${lang.entries.length ? lang.entries.map((e) => `
+        <div class="visitor-entry">
+          <div class="zh">${esc(e.source_text)}</div>
+          <div class="t">${esc(e.text)}</div>
+        </div>`).join('') : '<div class="visitor-empty">当前暂无在展展签。</div>'}
+    </div>`;
+  }).join('');
+  document.getElementById('content').className = '';
+  document.getElementById('content').innerHTML = html;
+}
+load().catch((e) => {
+  document.getElementById('content').textContent = '加载失败：' + e;
+});
+</script>
+</body>
+</html>

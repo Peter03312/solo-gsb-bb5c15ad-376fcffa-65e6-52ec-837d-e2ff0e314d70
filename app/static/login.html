@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · 展馆多语展签审校系统</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="card">
+    <h1>展馆多语展签审校</h1>
+    <div class="sub">本地账号登录</div>
+    <form id="login-form">
+      <label for="username">账号</label>
+      <input type="text" id="username" autocomplete="username" required>
+      <label for="password">密码</label>
+      <input type="password" id="password" autocomplete="current-password" required>
+      <div class="error" id="err"></div>
+      <div style="margin-top:14px">
+        <button type="submit" style="width:100%">登录</button>
+      </div>
+    </form>
+    <div class="hint-box">
+      默认账号（首次启动初始化，密码可用环境变量覆盖）：<br>
+      馆员 <code>librarian / lib123</code><br>
+      译者 <code>translator / tra123</code><br>
+      校对 <code>reviewer / rev123</code><br>
+      无需账号可访问 <a href="/visitor">游客页 →</a>
+    </div>
+  </div>
+</div>
+<script>
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById('err');
+  errEl.textContent = '';
+  try {
+    const resp = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('username').value.trim(),
+        password: document.getElementById('password').value,
+      }),
+    });
+    if (!resp.ok) {
+      const d = await resp.json().catch(() => ({}));
+      errEl.textContent = d.detail || '登录失败';
+      return;
+    }
+    location.href = '/app';
+  } catch (err) {
+    errEl.textContent = '网络错误：' + err;
+  }
+});
+</script>
+</body>
+</html>

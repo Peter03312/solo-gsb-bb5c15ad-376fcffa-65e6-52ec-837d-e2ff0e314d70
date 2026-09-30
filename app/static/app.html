@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>展签审校工作台</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="topbar">
+  <h1>展馆多语展签审校</h1>
+  <span class="badge-role" id="role-badge"></span>
+  <div class="spacer"></div>
+  <span class="who" id="who"></span>
+  <a href="/visitor" target="_blank" class="muted">游客页</a>
+  <button class="ghost small" id="logout-btn">退出</button>
+</div>
+
+<div class="container">
+  <!-- 馆员：原文与语言管理 -->
+  <div class="card" id="librarian-panel" hidden>
+    <h2>中文原文展签</h2>
+    <div id="label-admin"></div>
+    <div class="section-title"><h2 style="font-size:14px">新增展签</h2></div>
+    <textarea id="new-label-text" placeholder="输入中文原文"></textarea>
+    <div class="row-actions">
+      <button class="small" id="add-label-btn">新增展签</button>
+    </div>
+    <div class="section-title"><h2 style="font-size:14px">新增目标语言</h2></div>
+    <div class="grid cols-2">
+      <div><label>语言代码（如 en、ja、fr）</label><input type="text" id="new-lang-code"></div>
+      <div><label>语言名称</label><input type="text" id="new-lang-name"></div>
+    </div>
+    <div class="row-actions">
+      <button class="small" id="add-lang-btn">新增语言</button>
+    </div>
+  </div>
+
+  <!-- 语言切换 -->
+  <div class="card">
+    <h2>目标语言</h2>
+    <div class="langtabs" id="lang-tabs"></div>
+  </div>
+
+  <!-- 当前语言看板 -->
+  <div id="board"></div>
+
+  <!-- 已发布快照历史 -->
+  <div class="card">
+    <h2>已发布快照历史（不可变）</h2>
+    <div id="snapshot-list" class="muted">加载中…</div>
+  </div>
+</div>
+
+<!-- 快照查看弹窗 -->
+<div id="snapshot-modal" hidden
+     style="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:50;overflow:auto;padding:30px 10px">
+  <div class="card" style="max-width:760px;margin:0 auto;background:#fff">
+    <div class="section-title"><h2 id="snap-title"></h2><div class="spacer"></div>
+      <button class="ghost small" onclick="document.getElementById('snapshot-modal').hidden=true">关闭</button>
+    </div>
+    <div id="snap-body"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+services:
+  exhibit-review:
+    build: .
+    image: exhibit-review:latest
+    container_name: exhibit-review
+    ports:
+      - "8000:8000"
+    volumes:
+      - exhibit-data:/data
+    environment:
+      # 数据库文件位置（容器内），已挂载到命名卷
+      DB_PATH: /data/exhibit.db
+      # 可选：覆盖默认账号初始密码（仅在数据库首次初始化时生效）
+      SEED_LIBRARIAN_PW: ${SEED_LIBRARIAN_PW:-lib123}
+      SEED_TRANSLATOR_PW: ${SEED_TRANSLATOR_PW:-tra123}
+      SEED_REVIEWER_PW: ${SEED_REVIEWER_PW:-rev123}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/visitor')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  exhibit-data:
