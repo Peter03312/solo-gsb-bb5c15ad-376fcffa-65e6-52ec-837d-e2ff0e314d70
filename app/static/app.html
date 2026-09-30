@@ -42,6 +42,20 @@
     <div class="langtabs" id="lang-tabs"></div>
   </div>
 
+  <!-- 馆员：多语同批发布 -->
+  <div class="card" id="batch-panel" hidden>
+    <h2>多语同批发布</h2>
+    <div class="muted" style="margin-bottom:8px">
+      勾选至少两种目标语言后预览：仅当每种语言都覆盖当前全部在展展签、译文对应最新原文
+      且由非提交人确认，才能凭预览凭证一次整批提交；预览后任一相关状态变化，整批拒绝、不产生部分快照。
+    </div>
+    <div id="batch-lang-pickers" class="batch-pickers"></div>
+    <div class="row-actions">
+      <button class="small" id="batch-preview-btn">预览同批发布就绪情况</button>
+    </div>
+    <div id="batch-preview"></div>
+  </div>
+
   <!-- 当前语言看板 -->
   <div id="board"></div>
 

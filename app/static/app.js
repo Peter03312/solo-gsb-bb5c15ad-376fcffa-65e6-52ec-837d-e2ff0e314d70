@@ -6,6 +6,7 @@ const state = {
   languages: [],
   currentLangId: null,
   board: null,
+  batchPreview: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -38,7 +39,9 @@ async function api(path, opts = {}) {
     // 409 发布失败时 detail 为 {message, reasons}
     const d = data.detail;
     if (d && typeof d === 'object') {
-      throw new Error(d.message + (d.reasons && d.reasons.length ? '：' + d.reasons.join('；') : ''));
+      const err = new Error(d.message + (d.reasons && d.reasons.length ? '：' + d.reasons.join('；') : ''));
+      err.payload = d;
+      throw err;
     }
     throw new Error(typeof d === 'string' ? d : '请求失败 (' + resp.status + ')');
   }
@@ -64,7 +67,9 @@ async function init() {
 
   if (isLibrarian()) {
     $('#librarian-panel').hidden = false;
+    $('#batch-panel').hidden = false;
     bindLibrarianEvents();
+    bindBatchEvents();
   }
 
   await loadLanguages();
@@ -92,7 +97,126 @@ async function loadLanguages() {
       loadLanguages().then(loadBoard);
     }));
   await loadBoard();
-  if (isLibrarian()) loadLabelAdmin();
+  if (isLibrarian()) {
+    loadLabelAdmin();
+    renderBatchPickers();
+  }
+}
+
+// ---------------------------- 馆员：多语同批发布 ----------------------------
+
+function renderBatchPickers() {
+  const el = $('#batch-lang-pickers');
+  if (!state.languages.length) {
+    el.innerHTML = '<span class="muted">尚无目标语言。</span>';
+    return;
+  }
+  const prev = new Set((state.batchPreview?.languages || []).map((l) => l.language_id));
+  el.innerHTML = state.languages.map((l) => `
+    <label class="batch-pick">
+      <input type="checkbox" class="batch-lang" value="${l.id}" ${prev.has(l.id) ? 'checked' : ''}>
+      ${esc(l.name)} <span class="muted">${esc(l.code)}</span>
+    </label>`).join('');
+}
+
+function renderBatchPreview(p) {
+  state.batchPreview = p;
+  const el = $('#batch-preview');
+  const rows = p.languages.map((l) => {
+    const c = l.counts || {};
+    const badge = l.ready
+      ? '<span class="tag ready">就绪</span>'
+      : '<span class="tag ' + (c.missing ? 'missing' : 'stale') + '">未就绪</span>';
+    const detail = l.ready
+      ? `<span class="muted">覆盖 ${l.total} 条在展展签 · 下一版本 v${l.next_version}（当前 v${l.current_version || '—'}）</span>`
+      : `<ul>${l.blocking_reasons.map((r) => `<li>${esc(r)}</li>`).join('')}</ul>`;
+    return `
+      <div class="batch-lang-row ${l.ready ? 'ok' : 'blocked'}">
+        <div><b>${esc(l.name)}</b> <span class="muted">${esc(l.code)}</span> ${badge}</div>
+        <div class="batch-lang-detail">${detail}</div>
+      </div>`;
+  }).join('');
+  el.innerHTML = `
+    <div class="publish-box ${p.ready ? 'ok' : 'blocked'}">
+      ${p.ready
+        ? `✅ 所选 ${p.languages.length} 种语言均已覆盖当前全部 ${p.on_display_total} 条在展展签，可以整批提交。`
+        : '🚫 所选语言未全部就绪，整批提交会被拒绝，原因如下：'}
+    </div>
+    ${rows}
+    <div class="muted" style="margin:8px 0">
+      校验凭证（提交时原样回传，无需手填）：
+      <code class="batch-cred">${esc(p.credential.slice(0, 48))}…</code>
+    </div>
+    <div class="row-actions">
+      <button id="batch-commit-btn" ${p.ready ? '' : 'disabled'}>
+        ${p.ready ? '凭凭证整批提交（原子生成各语言快照）' : '全部语言就绪后方可整批提交'}
+      </button>
+      <button class="ghost small" id="batch-repreview-btn">放弃凭证并重新预览</button>
+    </div>`;
+  $('#batch-commit-btn')?.addEventListener('click', commitBatch);
+  $('#batch-repreview-btn')?.addEventListener('click', () => previewBatch());
+}
+
+function renderBatchError(err) {
+  const el = $('#batch-preview');
+  const reasons = err.payload?.reasons || [];
+  el.innerHTML = `
+    <div class="publish-box blocked">
+      🚫 ${esc(err.payload?.message || err.message)}
+      ${reasons.length ? '<ul>' + reasons.map((r) => `<li>${esc(r)}</li>`).join('') + '</ul>' : ''}
+      <div class="row-actions"><button class="small" id="batch-repreview-btn">重新预览</button></div>
+    </div>`;
+  state.batchPreview = null;
+  $('#batch-repreview-btn')?.addEventListener('click', () => previewBatch());
+}
+
+async function previewBatch() {
+  const ids = [...document.querySelectorAll('.batch-lang:checked')].map((c) => Number(c.value));
+  if (ids.length < 2) {
+    return toast('请至少勾选两种不同的目标语言', true);
+  }
+  const btn = $('#batch-preview-btn');
+  btn.disabled = true;
+  try {
+    const p = await api('/api/publish-batches/preview', {
+      method: 'POST',
+      body: JSON.stringify({ language_ids: ids }),
+    });
+    renderBatchPreview(p);
+  } catch (e) {
+    if (e.payload) renderBatchError(e);
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function commitBatch() {
+  const p = state.batchPreview;
+  if (!p?.credential) return toast('请先预览', true);
+  const btn = $('#batch-commit-btn');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/publish-batches', {
+      method: 'POST',
+      body: JSON.stringify({ credential: p.credential }),
+    });
+    const summary = r.languages.map((l) => `${l.name} v${l.version}`).join('、');
+    toast(`批次 #${r.batch_no} 已发布：${summary}；各语言快照均不可变`);
+    state.batchPreview = null;
+    $('#batch-preview').innerHTML = '';
+    renderBatchPickers();
+    await Promise.all([loadBoard(), loadSnapshots()]);
+  } catch (e) {
+    if (e.payload) renderBatchError(e);
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function bindBatchEvents() {
+  $('#batch-preview-btn').addEventListener('click', () => previewBatch());
 }
 
 // ---------------------------- 馆员：原文与语言 ----------------------------
@@ -551,6 +675,7 @@ async function loadSnapshots() {
     <div class="item" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <span class="tag ready">v${s.version}</span>
       <b>${esc(s.name)}</b> <span class="muted">${esc(s.code)}</span>
+      ${s.batch_id ? `<span class="tag ready">同批 #${s.batch_id}</span>` : ''}
       <span class="muted">${esc(s.published_at)} · ${esc(s.published_by_name || '?')}</span>
       <div class="spacer" style="flex:1"></div>
       <button class="small ghost view-snap" data-id="${s.id}">查看内容</button>

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -22,6 +23,17 @@ def get_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
+
+def get_tx_conn() -> sqlite3.Connection:
+    """手动事务连接（autocommit 底层模式）：由调用方显式 BEGIN/COMMIT/ROLLBACK。
+
+    用于需要“整段校验 + 提交”共用同一一致性快照的场景（多语同批发布、
+    游客聚合查询），避免 sqlite3 模块在 DML 前隐式 BEGIN 与显式 BEGIN 冲突。
+    """
+    conn = get_conn()
+    conn.isolation_level = None
     return conn
 
 
@@ -100,7 +112,23 @@ CREATE TABLE IF NOT EXISTS snapshots (
     published_by INTEGER REFERENCES users(id),
     published_at TEXT NOT NULL,
     payload TEXT NOT NULL,           -- 不可变 JSON
+    batch_id INTEGER REFERENCES publish_batches(id),  -- 多语同批发布时所属批次；单语言发布为 NULL
     UNIQUE (language_id, version)
+);
+
+-- 多语同批发布：一次提交为每个所选语言各生成一个独立递增的不可变快照
+CREATE TABLE IF NOT EXISTS publish_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,                 -- 批次号（全局递增，即返回给馆员的 batch_no）
+    language_ids TEXT NOT NULL,                           -- 本批目标语言编号 JSON 数组（按请求顺序）
+    credential_issued_at TEXT NOT NULL,                   -- 预览签发校验凭证的时间
+    submitted_by INTEGER REFERENCES users(id),
+    submitted_at TEXT NOT NULL
+);
+
+-- 应用级键值（当前仅存多语同批发布校验凭证的 HMAC 密钥）
+CREATE TABLE IF NOT EXISTS app_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 """
 
@@ -130,6 +158,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE translations ADD COLUMN public_hidden INTEGER NOT NULL DEFAULT 0"
         )
+    snap_cols = {r["name"] for r in conn.execute("PRAGMA table_info(snapshots)").fetchall()}
+    if "batch_id" not in snap_cols:
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN batch_id INTEGER REFERENCES publish_batches(id)"
+        )
+
+    # 多语同批发布校验凭证的签名密钥（每库一个，重启不变）
+    if not conn.execute("SELECT 1 FROM app_meta WHERE key = 'batch_token_secret'").fetchone():
+        conn.execute(
+            "INSERT INTO app_meta (key, value) VALUES ('batch_token_secret', ?)",
+            (secrets.token_hex(32),),
+        )
 
 
 def init_db() -> None:
@@ -147,7 +187,6 @@ def init_db() -> None:
         for username, display_name, role, pw in seed_users:
             row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
             if not row:
-                import secrets
                 salt = secrets.token_hex(16)
                 conn.execute(
                     "INSERT INTO users (username, display_name, role, salt, pw_hash, created_at) "

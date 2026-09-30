@@ -213,3 +213,26 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .visitor-entry .t { font-size: 15px; margin-top: 6px; }
 .visitor-empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
 .snap-meta { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+
+/* 多语同批发布 */
+.batch-pickers { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.batch-pick { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; color: var(--ink); margin: 0; }
+.batch-pick input { width: auto; }
+.batch-lang-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-top: 8px;
+  font-size: 13.5px;
+}
+.batch-lang-row.ok { border-color: #86efac; background: var(--green-bg); }
+.batch-lang-row.blocked { border-color: #fecaca; background: var(--red-bg); }
+.batch-lang-row.blocked ul { margin: 4px 0 0; padding-left: 20px; color: var(--red); }
+.batch-cred {
+  display: inline-block;
+  max-width: 100%;
+  word-break: break-all;
+  background: var(--gray-bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+}

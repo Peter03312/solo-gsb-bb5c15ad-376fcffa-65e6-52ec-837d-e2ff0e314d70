@@ -8,6 +8,9 @@
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -21,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db
-from .db import get_conn, hash_password, now
+from .db import get_conn, get_tx_conn, hash_password, now
 
 # ---------------------------- 请求模型 ----------------------------
 
@@ -64,6 +67,15 @@ class RestoreBody(BaseModel):
 class ClaimBody(BaseModel):
     source_rev: int  # 读取时的原文修订号
     trans_rev: int  # 读取时的译文修订号
+
+
+class BatchPublishBody(BaseModel):
+    # 至少两种不同目标语言；重复编号由接口层拒绝（409）
+    language_ids: list[int] = Field(min_length=2)
+
+
+class BatchCommitBody(BaseModel):
+    credential: str = Field(min_length=1)  # 预览接口签发的校验凭证
 
 
 # 认领有效期：默认 30 分钟，可由环境变量覆盖（仅便于测试，文档中说明）
@@ -116,6 +128,154 @@ def _active_claims_map(conn, language_id: int, viewer_id: Optional[int],
         d["mine"] = viewer_id is not None and r["claimer_id"] == viewer_id
         result[r["label_id"]] = d
     return result
+
+
+# ---------------------------- 多语同批发布：状态指纹与校验凭证 ----------------------------
+#
+# 预览时对“当前全部在展展签 × 所选各语言”的发布相关状态计算指纹并打包成凭证
+# （HMAC-SHA256 签名，密钥存于 app_meta，每库一个）；提交时凭同一把写锁重放计算，
+# 任一位变化（原文/译文/确认/展签在展状态/所选语言最新发布版本）即整批拒绝。
+
+
+def _canonical(obj) -> bytes:
+    """确定性 JSON 序列化：键排序、紧凑分隔，保证同值同字节。"""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _b64url_decode(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _batch_secret(conn) -> str:
+    """取本库的凭证签名密钥；缺失时补一个（兼容手工建库）。"""
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key = 'batch_token_secret'"
+    ).fetchone()
+    if row:
+        return row["value"]
+    secret = secrets.token_hex(32)
+    conn.execute(
+        "INSERT OR IGNORE INTO app_meta (key, value) VALUES ('batch_token_secret', ?)",
+        (secret,),
+    )
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key = 'batch_token_secret'"
+    ).fetchone()
+    return row["value"] if row else secret
+
+
+def _on_display_labels(conn) -> list:
+    """当前全部在展展签，按编号升序（预览与提交共用，保证口径一致）。"""
+    return conn.execute(
+        "SELECT * FROM labels WHERE status = 'on_display' ORDER BY id"
+    ).fetchall()
+
+
+def _source_hash(label) -> str:
+    return hashlib.sha256(_canonical({
+        "t": label["source_text"],
+        "rev": label["source_rev"],
+    })).hexdigest()
+
+
+def _item_status(label, t) -> tuple[str, str]:
+    """单展签×语言的就绪状态与原因（与 build_board 口径一致，另加“非提交人确认”硬校验）。"""
+    if t is None:
+        return "missing", "尚无译文"
+    if t["source_rev_at_edit"] != label["source_rev"]:
+        return "stale", f"译文基于原文修订 {t['source_rev_at_edit']}，当前为 {label['source_rev']}"
+    if not t["confirmed"]:
+        return "pending", "译文待校对确认"
+    if t["confirmer_id"] is None or t["confirmer_id"] == t["translator_id"]:
+        # 正常流程已禁止自审，这里作为发布前的最终防线
+        return "pending", "译文须由非提交人确认"
+    return "ready", "已确认，可发布"
+
+
+def _item_hash(label, t) -> str:
+    return hashlib.sha256(_canonical({
+        "s": label["source_text"],
+        "srev": label["source_rev"],
+        "t": None if t is None else t["text"],
+        "trev": None if t is None else t["trans_rev"],
+        "srev_at": None if t is None else t["source_rev_at_edit"],
+        "ok": None if t is None else bool(t["confirmed"]),
+        "cid": None if t is None else t["confirmer_id"],
+        "tid": None if t is None else t["translator_id"],
+        "hid": None if t is None else bool(t["public_hidden"]),
+    })).hexdigest()
+
+
+def _lang_fingerprint(conn, lang_id: int, labels: list) -> dict:
+    """某语言相对给定在展展签集合的指纹、逐条状态与最新发布版本。"""
+    trans_rows = conn.execute(
+        "SELECT * FROM translations WHERE language_id = ?", (lang_id,)
+    ).fetchall()
+    tmap = {t["label_id"]: t for t in trans_rows}
+    items: dict[str, dict] = {}
+    for lb in labels:
+        t = tmap.get(lb["id"])
+        status, reason = _item_status(lb, t)
+        items[str(lb["id"])] = {
+            "st": status,
+            "rsn": reason,
+            "h": _item_hash(lb, t),
+        }
+    latest = conn.execute(
+        "SELECT MAX(version) AS v FROM snapshots WHERE language_id = ?", (lang_id,)
+    ).fetchone()["v"]
+    return {"items": items, "latest": latest}
+
+
+def _batch_state(conn, lang_ids: list[int]) -> dict:
+    labels = _on_display_labels(conn)
+    return {
+        "labels": {str(lb["id"]): {"h": _source_hash(lb)} for lb in labels},
+        "langs": {str(lid): _lang_fingerprint(conn, lid, labels) for lid in lang_ids},
+    }
+
+
+def _issue_credential(conn, *, lang_ids: list[int], state: dict, user_id: int) -> str:
+    payload = {
+        "v": 1,
+        "u": user_id,
+        "ids": lang_ids,
+        "st": state,
+        "iat": now(),
+    }
+    body = _b64url(_canonical(payload))
+    sig = hmac.new(_batch_secret(conn).encode(), body.encode(), hashlib.sha256).digest()
+    return body + "." + _b64url(sig)
+
+
+def _read_credential(conn, credential: str) -> Optional[dict]:
+    """校验并解析凭证；签名错误/格式损坏/字段缺失一律返回 None。"""
+    try:
+        body_b64, sig_b64 = credential.split(".", 1)
+        expected = hmac.new(_batch_secret(conn).encode(), body_b64.encode(),
+                            hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, _b64url_decode(sig_b64)):
+            return None
+        data = json.loads(_b64url_decode(body_b64))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("st"), dict) \
+            or not isinstance(data.get("ids"), list) or not isinstance(data.get("u"), int):
+        return None
+    return data
+
+
+_STATUS_CN = {"missing": "缺译", "stale": "译文过期", "pending": "待审", "ready": "已确认"}
+_ITEM_HINT = {
+    "missing": "缺少译文",
+    "stale": "译文已不对应最新原文（过期）",
+    "pending": "尚未由非提交人确认（待审）",
+    "ready": "该条状态已变化，请重新预览",
+}
 
 
 # ---------------------------- 应用生命周期 ----------------------------
@@ -797,7 +957,7 @@ def release_translation_claim(
 def list_snapshots(user: dict = Depends(current_user)):
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT s.id, s.language_id, s.version, s.published_at, l.code, l.name, "
+            "SELECT s.id, s.language_id, s.version, s.published_at, s.batch_id, l.code, l.name, "
             "u.display_name AS published_by_name "
             "FROM snapshots s JOIN languages l ON l.id = s.language_id "
             "LEFT JOIN users u ON u.id = s.published_by "
@@ -816,6 +976,56 @@ def get_snapshot(snapshot_id: int, user: dict = Depends(current_user)):
             "published_at": row["published_at"], "payload": json.loads(row["payload"])}
 
 
+def _create_snapshot(conn, b: dict, language_id: int, user_id: int,
+                     batch_id: Optional[int]) -> dict:
+    """按看板当前就绪内容创建一个不可变语言快照（递增版本号）。
+
+    调用方须已在写锁内确认该语言可发布（b["publishable"]）。
+    batch_id 非空表示该快照属于一次多语同批发布。
+    随发布清除在展展签在该语言的游客隐藏标记（撤展展签不在 items 中，保持隐藏）。
+    """
+    last = conn.execute(
+        "SELECT MAX(version) AS v FROM snapshots WHERE language_id = ?",
+        (language_id,),
+    ).fetchone()["v"]
+    version = (last or 0) + 1
+
+    entries = []
+    for item in b["items"]:
+        t = item["translation"]
+        entries.append({
+            "label_id": item["label"]["id"],
+            "source_text": item["label"]["source_text"],
+            "source_rev": item["label"]["source_rev"],
+            "text": t["text"],
+            "trans_rev": t["trans_rev"],
+            "translator_id": t["translator_id"],
+            "confirmer_id": t["confirmer_id"],
+        })
+    payload = {
+        "language_id": language_id,
+        "language_code": b["language"]["code"],
+        "language_name": b["language"]["name"],
+        "version": version,
+        "entries": entries,
+    }
+    cur = conn.execute(
+        "INSERT INTO snapshots (language_id, version, published_by, published_at, payload, batch_id) "
+        "VALUES (?,?,?,?,?,?)",
+        (language_id, version, user_id, now(),
+         json.dumps(payload, ensure_ascii=False), batch_id),
+    )
+    on_display_ids = [item["label"]["id"] for item in b["items"]]
+    if on_display_ids:
+        placeholders = ",".join("?" for _ in on_display_ids)
+        conn.execute(
+            f"UPDATE translations SET public_hidden = 0 "
+            f"WHERE language_id = ? AND label_id IN ({placeholders})",
+            [language_id, *on_display_ids],
+        )
+    return {"snapshot_id": cur.lastrowid, "version": version}
+
+
 @app.post("/api/board/{language_id}/publish")
 def publish_snapshot(
     language_id: int, user: dict = Depends(require_roles("librarian"))
@@ -829,49 +1039,275 @@ def publish_snapshot(
                 "message": "当前语言尚不可发布",
                 "reasons": b["blocking_reasons"],
             })
-
-        last = conn.execute(
-            "SELECT MAX(version) AS v FROM snapshots WHERE language_id = ?",
-            (language_id,),
-        ).fetchone()["v"]
-        version = (last or 0) + 1
-
-        entries = []
-        for item in b["items"]:
-            t = item["translation"]
-            entries.append({
-                "label_id": item["label"]["id"],
-                "source_text": item["label"]["source_text"],
-                "source_rev": item["label"]["source_rev"],
-                "text": t["text"],
-                "trans_rev": t["trans_rev"],
-                "translator_id": t["translator_id"],
-                "confirmer_id": t["confirmer_id"],
-            })
-        payload = {
-            "language_id": language_id,
-            "language_code": b["language"]["code"],
-            "language_name": b["language"]["name"],
-            "version": version,
-            "entries": entries,
-        }
-        cur = conn.execute(
-            "INSERT INTO snapshots (language_id, version, published_by, published_at, payload) "
-            "VALUES (?,?,?,?,?)",
-            (language_id, version, user["id"], now(), json.dumps(payload, ensure_ascii=False)),
-        )
-        # 本快照含在展展签：清除该语言的游客隐藏标记（撤展的展签不在 items 中，保持隐藏）
-        on_display_ids = [item["label"]["id"] for item in b["items"]]
-        if on_display_ids:
-            placeholders = ",".join("?" for _ in on_display_ids)
-            conn.execute(
-                f"UPDATE translations SET public_hidden = 0 "
-                f"WHERE language_id = ? AND label_id IN ({placeholders})",
-                [language_id, *on_display_ids],
-            )
+        created = _create_snapshot(conn, b, language_id, user["id"], None)
         conn.commit()
-        sid = cur.lastrowid
-    return {"id": sid, "version": version}
+    return {"id": created["snapshot_id"], "version": created["version"]}
+
+
+# ---------------------------- 多语同批发布：预览 / 提交 / 查询 ----------------------------
+
+
+def _batch_reject(message: str, reasons: list[str]):
+    """整批拒绝：409，detail 固定携带 message 与 reasons（不产生任何快照）。"""
+    return HTTPException(409, {"message": message, "reasons": reasons})
+
+
+@app.post("/api/publish-batches/preview")
+def preview_batch(body: BatchPublishBody, user: dict = Depends(require_roles("librarian"))):
+    """馆员预览同批发布：至少两种不同目标语言。
+
+    - 未知语言 404；语言编号重复 409；不足两种 422（Pydantic）；
+    - 当前没有任何在展展签 409（无在展展签应拒绝）。
+    - 预览不发布任何内容，只返回各语言就绪情况、阻断原因与下一个版本号，
+      以及一次性的校验凭证 credential（凭该凭证调用提交接口）。
+    """
+    with db._write_lock, get_tx_conn() as conn:
+        conn.execute("BEGIN")
+        lang_ids = body.language_ids
+        if len(lang_ids) < 2:
+            raise HTTPException(422, "同批发布至少选择两种不同目标语言")
+        if len(set(lang_ids)) != len(lang_ids):
+            raise HTTPException(409, "所选语言存在重复编号，每种语言只能选择一次")
+        langs = []
+        for lid in lang_ids:
+            row = conn.execute("SELECT * FROM languages WHERE id = ?", (lid,)).fetchone()
+            if not row:
+                raise HTTPException(404, f"语言编号 {lid} 不存在")
+            langs.append(row)
+
+        labels = _on_display_labels(conn)
+        if not labels:
+            raise _batch_reject(
+                "当前没有在展展签（全部展签均已撤展或尚未建档），不能发布",
+                ["当前没有在展展签，不能发布任何语言快照"],
+            )
+
+        languages_out = []
+        ready_all = True
+        for lid, lang in zip(lang_ids, langs):
+            b = build_board(conn, lid)
+            # 看板口径之外，补一条“确认人非提交人”的发布前硬校验
+            extra = []
+            for item in b["items"]:
+                t = item["translation"]
+                if t and t["confirmed"] and t["confirmer_id"] == t["translator_id"]:
+                    extra.append(
+                        f"展签 #{item['label']['id']} 的确认人即译文提交人，须由他人重新确认"
+                    )
+            reasons = list(b["blocking_reasons"]) + extra
+            ready = b["publishable"] and not extra
+            ready_all = ready_all and ready
+            next_version = ((b["latest_snapshot"] or {}).get("version") or 0) + 1
+            languages_out.append({
+                "language_id": lid,
+                "code": lang["code"],
+                "name": lang["name"],
+                "ready": ready,
+                "total": b["total"],
+                "counts": b["counts"],
+                "next_version": next_version,
+                "current_version": (b["latest_snapshot"] or {}).get("version"),
+                "blocking_reasons": reasons,
+            })
+
+        state = _batch_state(conn, lang_ids)
+        credential = _issue_credential(
+            conn, lang_ids=lang_ids, state=state, user_id=user["id"]
+        )
+    return {
+        "ready": ready_all,
+        "on_display_total": len(labels),
+        "credential": credential,
+        "languages": languages_out,
+    }
+
+
+@app.post("/api/publish-batches")
+def commit_batch(body: BatchCommitBody, user: dict = Depends(require_roles("librarian"))):
+    """凭预览凭证整批提交：各语言同时通过才一次生成全部快照。
+
+    任一语言缺译/过期/待审，或预览后相关原文、译文、确认、展签在展状态、
+    所选语言最新发布版本发生变化，整批 409 并指出原因，不产生任何部分快照。
+    """
+    with db._write_lock, get_tx_conn() as conn:
+        conn.execute("BEGIN")
+        data = _read_credential(conn, body.credential)
+        if data is None:
+            raise _batch_reject(
+                "校验凭证无效或已损坏",
+                ["校验凭证无效：请重新调用预览接口获取凭证"],
+            )
+        if data["u"] != user["id"]:
+            raise _batch_reject(
+                "校验凭证不属于当前账号",
+                ["该凭证由其他馆员预览签发，请重新预览"],
+            )
+        lang_ids = data["ids"]
+        old_state = data["st"]
+
+        for lid in lang_ids:
+            if not conn.execute("SELECT 1 FROM languages WHERE id = ?", (lid,)).fetchone():
+                raise _batch_reject(
+                    "所选语言已不存在", [f"语言编号 {lid} 已被删除，无法发布，请重新预览"]
+                )
+
+        # 1) 全局变化：在展展签集合与原文（编号、文本、原文修订号）
+        labels = _on_display_labels(conn)
+        cur_ids = {lb["id"] for lb in labels}
+        old_ids = {int(k) for k in old_state["labels"].keys()}
+        global_changes: list[str] = []
+        for gone in sorted(old_ids - cur_ids):
+            global_changes.append(f"展签 #{gone} 预览后已撤展（在展状态变化）")
+        for added in sorted(cur_ids - old_ids):
+            global_changes.append(f"展签 #{added} 预览后新增在展（在展展签集合变化）")
+        for lb in labels:
+            old_lb = old_state["labels"].get(str(lb["id"]))
+            if old_lb and old_lb["h"] != _source_hash(lb):
+                global_changes.append(
+                    f"展签 #{lb['id']} 的原文在预览后已修改（原文修订号现为 {lb['source_rev']}）"
+                )
+
+        # 2) 逐语言变化：最新发布版本 + 每条译文/确认，并汇总当前阻断原因
+        per_lang_changes: list[str] = []
+        blockers: list[str] = []
+        boards: dict[int, dict] = {}
+        for lid in lang_ids:
+            lang = conn.execute("SELECT * FROM languages WHERE id = ?", (lid,)).fetchone()
+            old_lang = old_state["langs"].get(str(lid))
+            cur_lang = _lang_fingerprint(conn, lid, labels)
+            label_name = lang["name"] if lang else f"#{lid}"
+
+            if old_lang is None:
+                per_lang_changes.append(f"{label_name}：预览凭证中不含该语言，请重新预览")
+                continue
+            if old_lang["latest"] != cur_lang["latest"]:
+                per_lang_changes.append(
+                    f"{label_name}：预览后该语言已发布新版本"
+                    f"（v{old_lang['latest']} → v{cur_lang['latest']}），请重新预览"
+                )
+            old_items = old_lang["items"]
+            cur_items = cur_lang["items"]
+            for iid, cur_item in cur_items.items():
+                old_item = old_items.get(iid)
+                if old_item is None:
+                    per_lang_changes.append(
+                        f"{label_name}：展签 #{iid} 预览后新增，不在预览范围内"
+                    )
+                    continue
+                if old_item["h"] != cur_item["h"]:
+                    per_lang_changes.append(
+                        f"{label_name}：展签 #{iid} 预览后译文或确认状态变化"
+                        f"（当前为{_STATUS_CN.get(cur_item['st'], cur_item['st'])}）"
+                    )
+            for iid in old_items.keys() - cur_items.keys():
+                per_lang_changes.append(
+                    f"{label_name}：展签 #{iid} 预览后撤出在展范围"
+                )
+
+            # 当前就绪情况（缺译/过期/待审整批拒绝并指出原因）
+            b = build_board(conn, lid)
+            boards[lid] = b
+            extra = []
+            for item in b["items"]:
+                t = item["translation"]
+                if t and t["confirmed"] and t["confirmer_id"] == t["translator_id"]:
+                    extra.append(
+                        f"展签 #{item['label']['id']} 的确认人即译文提交人，须由他人重新确认"
+                    )
+            for reason in list(b["blocking_reasons"]) + extra:
+                blockers.append(f"{label_name}：{reason}")
+
+        if global_changes or per_lang_changes:
+            raise _batch_reject(
+                "预览后发布相关状态已变化，整批拒绝，未生成任何快照",
+                global_changes + per_lang_changes,
+            )
+        if blockers:
+            raise _batch_reject(
+                "所选语言未全部就绪，整批拒绝，未生成任何快照", blockers
+            )
+
+        # 3) 全部通过：单事务一次性生成各语言独立递增的不可变快照
+        ts = now()
+        bcur = conn.execute(
+            "INSERT INTO publish_batches (language_ids, credential_issued_at, "
+            "submitted_by, submitted_at) VALUES (?,?,?,?)",
+            (json.dumps(lang_ids), data.get("iat"), user["id"], ts),
+        )
+        batch_id = bcur.lastrowid
+        versions = []
+        for lid in lang_ids:
+            created = _create_snapshot(conn, boards[lid], lid, user["id"], batch_id)
+            lang = conn.execute("SELECT * FROM languages WHERE id = ?", (lid,)).fetchone()
+            versions.append({
+                "language_id": lid,
+                "code": lang["code"],
+                "name": lang["name"],
+                "snapshot_id": created["snapshot_id"],
+                "version": created["version"],
+            })
+        conn.commit()
+    return {
+        "batch_no": batch_id,
+        "submitted_at": ts,
+        "languages": versions,
+    }
+
+
+@app.get("/api/publish-batches")
+def list_publish_batches(user: dict = Depends(current_user)):
+    """批次历史：按批次号倒序。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pb.*, u.display_name AS submitted_by_name "
+            "FROM publish_batches pb LEFT JOIN users u ON u.id = pb.submitted_by "
+            "ORDER BY pb.id DESC"
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            snap_rows = conn.execute(
+                "SELECT s.id AS snapshot_id, s.language_id, s.version, l.code, l.name "
+                "FROM snapshots s JOIN languages l ON l.id = s.language_id "
+                "WHERE s.batch_id = ? ORDER BY s.id",
+                (r["id"],),
+            ).fetchall()
+            d["language_ids"] = json.loads(r["language_ids"])
+            d["snapshots"] = [dict(s) for s in snap_rows]
+            result.append(d)
+    return result
+
+
+@app.get("/api/publish-batches/{batch_no}")
+def get_publish_batch(batch_no: int, user: dict = Depends(current_user)):
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT pb.*, u.display_name AS submitted_by_name "
+            "FROM publish_batches pb LEFT JOIN users u ON u.id = pb.submitted_by "
+            "WHERE pb.id = ?",
+            (batch_no,),
+        ).fetchone()
+        if not r:
+            raise HTTPException(404, "批次不存在")
+        d = dict(r)
+        snap_rows = conn.execute(
+            "SELECT s.id AS snapshot_id, s.language_id, s.version, l.code, l.name, "
+            "s.published_at, s.payload "
+            "FROM snapshots s JOIN languages l ON l.id = s.language_id "
+            "WHERE s.batch_id = ? ORDER BY s.id",
+            (batch_no,),
+        ).fetchall()
+        d["language_ids"] = json.loads(r["language_ids"])
+        d["snapshots"] = [{
+            "snapshot_id": s["snapshot_id"],
+            "language_id": s["language_id"],
+            "code": s["code"],
+            "name": s["name"],
+            "version": s["version"],
+            "published_at": s["published_at"],
+            "payload": json.loads(s["payload"]),
+        } for s in snap_rows]
+    return d
 
 
 # ---------------------------- 游客公开页（无需登录） ----------------------------
@@ -884,35 +1320,46 @@ def public_languages():
     已撤展（或复展后尚未随新快照重新发布）的展签，立即从最新内容中隐藏；
     隐藏通过 translations.public_hidden 按语言实现，快照 JSON 本身不修改，
     因此历史快照与已登录用户的快照查询字段/内容均保持不变。
+
+    全部读取在同一只读事务（BEGIN）内完成：多语同批发布在单个写事务中提交，
+    WAL 下本查询要么读到批次提交前、要么读到提交后的完整状态，
+    同一次游客查询绝不会看到同一批次的部分新版本。
     """
-    with get_conn() as conn:
-        langs = conn.execute("SELECT * FROM languages ORDER BY id").fetchall()
-        result = []
-        for lang in langs:
-            snap = conn.execute(
-                "SELECT * FROM snapshots WHERE language_id = ? ORDER BY version DESC LIMIT 1",
-                (lang["id"],),
-            ).fetchone()
-            entry = {
-                "language": {"id": lang["id"], "code": lang["code"], "name": lang["name"]},
-                "published": snap is not None,
-            }
-            if snap:
-                payload = json.loads(snap["payload"])
-                hidden_rows = conn.execute(
-                    "SELECT label_id FROM translations "
-                    "WHERE language_id = ? AND public_hidden = 1",
+    with get_tx_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            langs = conn.execute("SELECT * FROM languages ORDER BY id").fetchall()
+            result = []
+            for lang in langs:
+                snap = conn.execute(
+                    "SELECT * FROM snapshots WHERE language_id = ? ORDER BY version DESC LIMIT 1",
                     (lang["id"],),
-                ).fetchall()
-                hidden = {r["label_id"] for r in hidden_rows}
-                entry.update({
-                    "snapshot_id": snap["id"],
-                    "version": snap["version"],
-                    "published_at": snap["published_at"],
-                    "entries": [e for e in payload["entries"]
-                                if e["label_id"] not in hidden],
-                })
-            result.append(entry)
+                ).fetchone()
+                entry = {
+                    "language": {"id": lang["id"], "code": lang["code"], "name": lang["name"]},
+                    "published": snap is not None,
+                }
+                if snap:
+                    payload = json.loads(snap["payload"])
+                    hidden_rows = conn.execute(
+                        "SELECT label_id FROM translations "
+                        "WHERE language_id = ? AND public_hidden = 1",
+                        (lang["id"],),
+                    ).fetchall()
+                    hidden = {r["label_id"] for r in hidden_rows}
+                    entry.update({
+                        "snapshot_id": snap["id"],
+                        "version": snap["version"],
+                        "batch_no": snap["batch_id"],
+                        "published_at": snap["published_at"],
+                        "entries": [e for e in payload["entries"]
+                                    if e["label_id"] not in hidden],
+                    })
+                result.append(entry)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     return result
 
 
