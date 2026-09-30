@@ -1,6 +1,6 @@
 # 展馆多语展签审校 Web 应用
 
-面向展馆的多语展签翻译—校对—发布流程系统。馆员维护中文原文与目标语言；译者逐条提交译文；另一名校对者确认；**同一账号不得确认自己的译文**。译文待审时，译者/校对者（提交者本人除外）可凭双修订号**认领 30 分钟**，认领期内仅认领人能确认。全部译文对应当前原文、全部确认后，馆员才能发布**不可变语言快照**；游客页只展示每种语言的最新已发布快照。
+面向展馆的多语展签翻译—校对—发布流程系统。馆员维护中文原文与目标语言；译者逐条提交译文；另一名校对者确认；**同一账号不得确认自己的译文**。译文待审时，译者/校对者（提交者本人除外）可凭双修订号**认领 30 分钟**，认领期内仅认领人能确认。全部译文对应当前原文、全部确认后，馆员才能发布**不可变语言快照**；也可一次勾选**至少两种语言**，先预览各语言就绪情况并领取校验凭证，再**同批原子发布**（各语言版本独立递增）；游客页只展示每种语言的最新已发布快照。
 
 技术栈：**Python 3.12 / FastAPI + SQLite（WAL）+ 原生 HTML/CSS/JavaScript**，无前端构建步骤。
 
@@ -50,6 +50,7 @@ docker compose down -v       # 同时删除数据库卷（慎用）
 | `SEED_TRANSLATOR_PW` | `tra123` | 译者初始密码 |
 | `SEED_REVIEWER_PW` | `rev123` | 校对初始密码 |
 | `CLAIM_TTL_SECONDS` | `1800` | 待审认领有效期秒数（默认 30 分钟；仅建议测试时改小） |
+| `BATCH_PREVIEW_TTL_SECONDS` | `600` | 多语言同批发布预览凭证有效期秒数（默认 10 分钟；仅建议测试时改小） |
 
 ## 工作流程与修订号规则
 
@@ -203,6 +204,126 @@ curl -b rev.cookie -X POST http://localhost:8000/api/board/1/labels/1/confirm \
 
 工作台操作：语言看板每条「待审」译文下展示认领状态条——未认领时非提交者可见【认领 30 分钟】与【确认译文】按钮；持有认领时显示**到期倒计时**、【提前释放认领】，确认按钮照常可用；他人持有时提示认领人与到期时间、隐藏确认按钮。到期瞬间页面自动刷新一次，接手/确认按钮即时出现。馆员看板只读展示认领人与到期时间。
 
+## 多语言同批发布（本轮新增）
+
+馆员在工作台可一次勾选**至少两种不同目标语言**，先预览同批发布的就绪情况、阻断原因并领取**校验凭证**，再凭该凭证一次性提交。
+
+### 规则要点
+
+- **两阶段：预览 → 凭证提交**
+  1. `POST /api/publish-batches/preview`：馆员提交语言编号列表（≥ 2 且不重复）。服务端返回每种语言的就绪状态、逐条展签状态、阻断原因清单、当前版本与**提交后将生成的下一版本号**，以及一次性校验凭证 `token`（默认 **10 分钟**有效，可用环境变量 `BATCH_PREVIEW_TTL_SECONDS` 覆盖）。预览**不产生任何快照**，未就绪时也会返回凭证（`ready=false`），但无法提交成功。
+  2. `POST /api/publish-batches`：馆员仅凭 `{"token": "..."}` 提交。
+- **就绪条件（每种语言都必须满足）**：该语言覆盖**当前全部在展展签**，每条译文都对应最新原文修订号、且由**非提交人**确认。任一语言缺译、过期、待审、确认人即提交人，或**当前没有任何在展展签**，整批拒绝（`409`），`detail` 中给出每种语言的阻断原因。
+- **预览后变化检测**：提交时在同一把写锁、单个事务内重算并对比预览时刻的完整指纹，覆盖：
+  - 原文（修订号/内容；预览后新增展签也算变化）；
+  - 展签在展状态（撤展/复展、状态版本）；
+  - 各语言译文（译文修订号、对应原文修订号、提交者）；
+  - 确认状态与确认人；
+  - 游客隐藏标记（撤展即时隐藏）；
+  - **所选语言的最新发布版本**（预览后有人用单语言接口发布了新版本，也会整批拒绝，提示重新预览）。
+  - 任一变化 → `409`，`detail.label_changes` / `detail.language_changes` 分别指出展签级与语言级的变化原因。
+- **原子性，不产生部分快照**：全部校验通过后，在**单个数据库事务**内登记批次并依次插入各语言快照；任何一步失败整体回滚。失败与过期时凭证**不被消耗**（但因指纹已变，需重新预览）；成功后凭证立即作废，**不能重复使用**。并发提交同一凭证：一个成功（`200`），其余 `409`。
+- **各语言版本独立递增、快照不可变**：版本号仍按语言各自 `MAX(version)+1` 计算（例如 en 当前 v3、ja 当前 v1，则本批生成 en v4、ja v2）。成功返回人类可读**批次号** `batch_no`（`PB-000001` 起）与各语言版本/快照编号。快照 JSON 一经生成不提供任何修改/删除接口；同批快照通过 `snapshots.batch_id` 与批次关联。
+- **兼容承诺全部保持**：
+  - 既有单语言发布 `POST /api/board/{lang_id}/publish` 继续可用，行为不变（不属于任何批次）；
+  - 游客接口 `GET /api/public/languages` 的响应结构不变；因各语言快照在同一事务内插入，**同一次游客查询不会看到该批次的部分新版本**；
+  - 撤展仍通过隐藏标记**即时**从游客最新内容隐藏，历史快照 JSON 原样保留；
+  - 历史快照查询 `GET /api/snapshots/{id}` 字段与内容不变（列表接口额外带 `batch_id`，可为 `null`）。
+- **入参拒绝**：语言未知（编号不存在）→ `404`；语言重复或少于两种 → `422`；非馆员 → `403`；未登录 → `401`；凭证不存在 → `404`，凭证已使用/已过期 → `409`。
+
+### HTTP API
+
+| 方法 | 路径 | 角色 | 请求体 | 说明 |
+|---|---|---|---|---|
+| POST | `/api/publish-batches/preview` | librarian | `{"language_ids": [1, 2]}` | 预览各语言就绪情况与阻断原因，返回校验凭证 `token`（不产生快照） |
+| POST | `/api/publish-batches` | librarian | `{"token": "..."}` | 凭凭证整批提交；全部通过才生成各语言独立递增的不可变快照，返回批次号与各语言版本 |
+| GET | `/api/publish-batches` | 已登录 | — | 批次历史（含每语言版本与快照编号） |
+| GET | `/api/publish-batches/{id}` | 已登录 | — | 单批次详情 |
+
+预览响应主要字段：
+
+```json
+{
+  "token": "gkCQVYzbhyb8...",
+  "ready": false,
+  "language_count": 2,
+  "previewed_at": "2026-09-30 17:20:00",
+  "expires_at": "2026-09-30 17:30:00",
+  "languages": [
+    {
+      "language_id": 1, "code": "en", "name": "English",
+      "ready": false,
+      "blocking_reasons": ["1 条待校对确认"],
+      "counts": {"missing": 0, "pending": 1, "stale": 0, "ready": 2},
+      "total_on_display": 3, "withdrawn_total": 0,
+      "current_version": 1, "next_version": 2,
+      "items": [{"label_id": 1, "source_rev": 1, "status": "pending",
+                 "reason": "译文待校对确认", "trans_rev": 2}]
+    }
+  ]
+}
+```
+
+整批提交成功响应：
+
+```json
+{
+  "batch_no": "PB-000001",
+  "batch_id": 1,
+  "published_at": "2026-09-30 17:22:29",
+  "published_by": "馆员（管理员）",
+  "language_count": 2,
+  "immutable": true,
+  "languages": [
+    {"language_id": 1, "code": "en", "name": "English", "version": 1, "snapshot_id": 1, "entry_count": 3},
+    {"language_id": 2, "code": "ja", "name": "日本語", "version": 1, "snapshot_id": 2, "entry_count": 3}
+  ]
+}
+```
+
+整批拒绝时 `409` 响应体 `detail` 形如：
+
+```json
+{
+  "message": "整批拒绝：预览后状态发生变化或仍有语言未就绪，未产生任何快照",
+  "label_changes": ["展签 #1 原文已修订（修订号 1 → 2）"],
+  "language_changes": {
+    "1": ["1 条译文基于旧版原文（过期）", "1 条待校对确认"],
+    "2": []
+  },
+  "languages": [ {"language_id": 1, "name": "English", "ready": false, "...": "..."} ]
+}
+```
+
+### curl 调用示例
+
+```bash
+B=http://localhost:8000
+# 1) 馆员登录
+curl -c lib.cookie -X POST $B/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"librarian","password":"lib123"}'
+
+# 2) 选择英语(1)、日语(2)预览：查看 ready / blocking_reasons / 下一版本号，取 token
+curl -b lib.cookie -X POST $B/api/publish-batches/preview \
+  -H 'Content-Type: application/json' -d '{"language_ids":[1,2]}'
+
+# 3) 校验入参：未知语言 404、重复语言 422、仅一种语言 422
+curl -i -b lib.cookie -X POST $B/api/publish-batches/preview \
+  -H 'Content-Type: application/json' -d '{"language_ids":[1,999]}'
+
+# 4) 凭凭证整批提交（全部就绪时）：返回批次号 PB-xxxxxx 与各语言版本
+curl -b lib.cookie -X POST $B/api/publish-batches \
+  -H 'Content-Type: application/json' -d '{"token":"<上一步返回的 token>"}'
+
+# 5) 同一次游客查询：两种语言同时为新版本（事务原子，无部分可见）
+curl $B/api/public/languages
+
+# 6) 重复使用同一凭证 -> 409；批次历史
+curl -b lib.cookie $B/api/publish-batches
+```
+
+工作台操作：馆员在「多语言同批发布」卡片勾选语言（默认勾选前两种）→【预览所选语言就绪情况】，逐语言展示在展总数、待译/待审/过期/已确认统计、阻断原因和「当前 vN → 提交后 vM」；全部就绪后【凭凭证整批提交】可点，成功后显示批次号与各语言版本，下方「同批发布历史」可直接打开各语言快照。预览后若他人改动了原文/译文/确认/在展状态或抢先发布，提交会弹出具体变化原因，需要重新预览再提交。
+
 ## 本地无 Docker 运行（开发）
 
 ```bash
@@ -215,11 +336,11 @@ DB_PATH=./exhibit.db uvicorn app.main:app --reload
 
 ```
 app/
-├── db.py                 # 连接/Schema/默认数据初始化（账号、语言、示例展签）
-├── main.py               # FastAPI 全部接口、鉴权、看板聚合与发布逻辑
+├── db.py                 # 连接/Schema/默认数据初始化（账号、语言、示例展签、发布批次/凭证表）
+├── main.py               # FastAPI 全部接口、鉴权、看板聚合、单语言与多语言批次发布逻辑
 └── static/
     ├── login.html        # 登录页
-    ├── app.html/app.js   # 审校工作台（按角色显示操作）
+    ├── app.html/app.js   # 审校工作台（按角色显示操作，含多语言同批发布）
     ├── visitor.html      # 游客公开页
     └── styles.css
 Dockerfile

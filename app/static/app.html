@@ -42,6 +42,25 @@
     <div class="langtabs" id="lang-tabs"></div>
   </div>
 
+  <!-- 馆员：多语言同批发布 -->
+  <div class="card" id="batch-panel" hidden>
+    <h2>多语言同批发布（至少两种语言）</h2>
+    <div class="muted" style="margin-bottom:8px">
+      先勾选语言并预览各语言就绪情况与阻断原因，凭预览返回的校验凭证一次性提交；
+      每种语言各自生成独立递增的不可变快照。预览后原文 / 译文 / 确认 / 在展状态 /
+      所选语言最新版本若有变化，整批拒绝、不产生部分快照。
+    </div>
+    <div id="batch-lang-picker" class="batch-picker"></div>
+    <div class="row-actions">
+      <button class="small" id="batch-preview-btn">预览所选语言就绪情况</button>
+      <button class="small" id="batch-commit-btn" disabled>凭凭证整批提交</button>
+      <button class="small ghost" id="batch-clear-btn">清空预览</button>
+    </div>
+    <div id="batch-preview"></div>
+    <div class="section-title"><h2 style="font-size:14px">同批发布历史</h2></div>
+    <div id="batch-history" class="muted">加载中…</div>
+  </div>
+
   <!-- 当前语言看板 -->
   <div id="board"></div>
 

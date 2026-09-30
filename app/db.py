@@ -93,6 +93,35 @@ CREATE TABLE IF NOT EXISTS review_claims (
     UNIQUE (label_id, language_id)      -- 同一译文同一时刻仅一行认领记录
 );
 
+CREATE TABLE IF NOT EXISTS publish_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_no TEXT NOT NULL UNIQUE,          -- 人类可读批次号 PB-000001
+    committed_by INTEGER REFERENCES users(id),
+    published_at TEXT NOT NULL,
+    preview_token TEXT,                     -- 成功提交所用的预览凭证
+    language_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS publish_batch_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES publish_batches(id),
+    language_id INTEGER NOT NULL REFERENCES languages(id),
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+    version INTEGER NOT NULL,               -- 该语言在本批次中生成的独立递增版本号
+    UNIQUE (batch_id, language_id)
+);
+
+CREATE TABLE IF NOT EXISTS publish_previews (
+    token TEXT PRIMARY KEY,                 -- 校验凭证（secrets 随机串）
+    language_ids TEXT NOT NULL,             -- JSON 数组：本次所选语言编号
+    state_json TEXT NOT NULL,               -- 预览时刻的完整校验指纹（展签/译文/确认/最新版本）
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,               -- 凭证到期时间（默认 10 分钟）
+    consumed_at TEXT,                       -- 成功整批提交后写入；NULL 表示尚未使用
+    batch_id INTEGER REFERENCES publish_batches(id)
+);
+
 CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     language_id INTEGER NOT NULL REFERENCES languages(id),
@@ -100,6 +129,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     published_by INTEGER REFERENCES users(id),
     published_at TEXT NOT NULL,
     payload TEXT NOT NULL,           -- 不可变 JSON
+    batch_id INTEGER REFERENCES publish_batches(id),  -- 多语言同批发布时所属批次；单语言发布为 NULL
     UNIQUE (language_id, version)
 );
 """
@@ -129,6 +159,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "public_hidden" not in trans_cols:
         conn.execute(
             "ALTER TABLE translations ADD COLUMN public_hidden INTEGER NOT NULL DEFAULT 0"
+        )
+    snap_cols = {r["name"] for r in conn.execute("PRAGMA table_info(snapshots)").fetchall()}
+    if snap_cols and "batch_id" not in snap_cols:
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN batch_id INTEGER"
         )
 
 

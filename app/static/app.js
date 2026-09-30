@@ -6,6 +6,7 @@ const state = {
   languages: [],
   currentLangId: null,
   board: null,
+  batchPreview: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -35,10 +36,24 @@ async function api(path, opts = {}) {
   }
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    // 409 发布失败时 detail 为 {message, reasons}
+    // 409 发布失败时 detail 为 {message, reasons}；多语言整批拒绝时含每语言原因/变化
     const d = data.detail;
     if (d && typeof d === 'object') {
-      throw new Error(d.message + (d.reasons && d.reasons.length ? '：' + d.reasons.join('；') : ''));
+      let msg = d.message || '请求失败';
+      if (d.reasons && d.reasons.length) msg += '：' + d.reasons.join('；');
+      if (d.language_changes) {
+        const per = Object.entries(d.language_changes)
+          .filter(([, rs]) => rs && rs.length)
+          .map(([lid, rs]) => {
+            const lang = (d.languages || []).find((l) => String(l.language_id) === lid);
+            return (lang ? lang.name + '：' : `语言${lid}：`) + rs.join('；');
+          });
+        if (per.length) msg += '；' + per.join('；');
+      }
+      if (d.label_changes && d.label_changes.length) {
+        msg += '；展签变化：' + d.label_changes.join('；');
+      }
+      throw new Error(msg);
     }
     throw new Error(typeof d === 'string' ? d : '请求失败 (' + resp.status + ')');
   }
@@ -64,7 +79,9 @@ async function init() {
 
   if (isLibrarian()) {
     $('#librarian-panel').hidden = false;
+    $('#batch-panel').hidden = false;
     bindLibrarianEvents();
+    bindBatchEvents();
   }
 
   await loadLanguages();
@@ -91,8 +108,12 @@ async function loadLanguages() {
       state.currentLangId = Number(b.dataset.id);
       loadLanguages().then(loadBoard);
     }));
+  renderBatchPicker();
   await loadBoard();
-  if (isLibrarian()) loadLabelAdmin();
+  if (isLibrarian()) {
+    loadLabelAdmin();
+    loadBatchHistory();
+  }
 }
 
 // ---------------------------- 馆员：原文与语言 ----------------------------
@@ -528,6 +549,133 @@ function tickClaimCountdowns() {
 
 tickClaimCountdowns._board = true;
 setInterval(tickClaimCountdowns, 1000);
+
+// ---------------------------- 多语言同批发布 ----------------------------
+
+function renderBatchPicker() {
+  if (!isLibrarian()) return;
+  const el = $('#batch-lang-picker');
+  if (!state.languages.length) {
+    el.innerHTML = '<span class="muted">尚无目标语言。</span>';
+    return;
+  }
+  // 默认勾选前两种语言
+  const prev = state.batchPreview
+    ? new Set(state.batchPreview.languages.map((l) => l.language_id))
+    : new Set(state.languages.slice(0, 2).map((l) => l.id));
+  el.innerHTML = state.languages.map((l) => `
+    <label>
+      <input type="checkbox" class="batch-lang-check" value="${l.id}"
+             ${prev.has(l.id) ? 'checked' : ''}>
+      ${esc(l.name)} <span class="muted">${esc(l.code)}</span>
+    </label>`).join('');
+  el.querySelectorAll('.batch-lang-check').forEach((c) =>
+    c.addEventListener('change', () => {
+      // 选择变化后旧凭证即无意义，清空预览
+      state.batchPreview = null;
+      $('#batch-preview').innerHTML = '';
+      $('#batch-commit-btn').disabled = true;
+    }));
+}
+
+function bindBatchEvents() {
+  $('#batch-preview-btn').addEventListener('click', async () => {
+    const ids = [...document.querySelectorAll('.batch-lang-check:checked')].map((c) => Number(c.value));
+    if (ids.length < 2) return toast('请至少勾选两种不同的目标语言', true);
+    const btn = $('#batch-preview-btn');
+    btn.disabled = true;
+    try {
+      state.batchPreview = await api('/api/publish-batches/preview', {
+        method: 'POST',
+        body: JSON.stringify({ language_ids: ids }),
+      });
+      renderBatchPreview();
+    } catch (e) { toast(e.message, true); }
+    btn.disabled = false;
+  });
+
+  $('#batch-commit-btn').addEventListener('click', batchCommit);
+  $('#batch-clear-btn').addEventListener('click', () => {
+    state.batchPreview = null;
+    $('#batch-preview').innerHTML = '';
+    $('#batch-commit-btn').disabled = true;
+  });
+}
+
+function renderBatchPreview() {
+  const p = state.batchPreview;
+  if (!p) return;
+  const box = $('#batch-preview');
+  $('#batch-commit-btn').disabled = !p.ready;
+  const banner = p.ready
+    ? `<div class="publish-box ok">✅ 全部 ${p.language_count} 种语言就绪，可以凭凭证整批提交。</div>`
+    : `<div class="publish-box blocked">🚫 尚不可整批提交，请先处理下列阻断原因。</div>`;
+  box.innerHTML = banner + p.languages.map((l) => {
+    const c = l.counts;
+    const head = l.ready
+      ? `<div class="batch-lang"><b>${esc(l.name)}</b> <span class="muted">${esc(l.code)}</span>
+           <span class="tag ready">就绪</span>
+           <span class="muted">当前 v${l.current_version} → 提交后生成 v${l.next_version}（${l.total_on_display} 条在展）</span>
+           <div class="ok">将覆盖全部 ${l.total_on_display} 条在展展签。</div>`
+      : `<div class="batch-lang"><b>${esc(l.name)}</b> <span class="muted">${esc(l.code)}</span>
+           <span class="tag ${c.ready === l.total_on_display && l.total_on_display > 0 ? 'ready' : 'stale'}">未就绪</span>
+           <span class="muted">在展 ${l.total_on_display} · 待译 ${c.missing} · 待审 ${c.pending} · 过期 ${c.stale} · 已确认 ${c.ready}</span>
+           <div class="reasons"><ul>${l.blocking_reasons.map((r) => `<li>${esc(r)}</li>`).join('')}</ul></div>`;
+    return head + '</div>';
+  }).join('') + `
+    <div class="batch-token">
+      校验凭证（${esc(p.expires_at)} UTC 前有效，提交后即作废）：<br><code>${esc(p.token)}</code>
+    </div>`;
+}
+
+async function batchCommit() {
+  const p = state.batchPreview;
+  if (!p || !p.ready) return;
+  const btn = $('#batch-commit-btn');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/publish-batches', {
+      method: 'POST',
+      body: JSON.stringify({ token: p.token }),
+    });
+    const detail = r.languages.map((l) => `${l.name} v${l.version}`).join('、');
+    toast(`批次 ${r.batch_no} 已发布：${detail}，快照不可变`);
+    state.batchPreview = null;
+    $('#batch-preview').innerHTML =
+      `<div class="publish-box ok">✅ 批次 <b>${esc(r.batch_no)}</b>（${esc(r.published_at)} UTC）：
+        ${r.languages.map((l) => `${esc(l.name)} <b>v${l.version}</b>`).join('、')}，均为不可变快照。</div>`;
+    await Promise.all([loadBoard(), loadSnapshots(), loadBatchHistory()]);
+  } catch (e) {
+    toast(e.message, true);
+    // 失败后必须重新预览（凭证可能已失效或状态已变化）
+    btn.disabled = true;
+  }
+}
+
+async function loadBatchHistory() {
+  const el = $('#batch-history');
+  const batches = await api('/api/publish-batches');
+  if (!batches.length) {
+    el.innerHTML = '<span class="muted">尚无同批发布记录。</span>';
+    return;
+  }
+  el.classList.remove('muted');
+  el.innerHTML = batches.map((b) => `
+    <div class="item" style="padding:10px 0">
+      <span class="tag ready">${esc(b.batch_no)}</span>
+      <b>${b.language_count} 种语言</b>
+      <span class="muted">${esc(b.published_at)} UTC · ${esc(b.committed_by_name || '?')}</span>
+      <div class="muted" style="margin-top:4px">
+        ${b.items.map((i) =>
+          `<a href="#" class="batch-snap" data-id="${i.snapshot_id}">${esc(i.name)} v${i.version}</a>`).join(' · ')}
+      </div>
+    </div>`).join('');
+  el.querySelectorAll('.batch-snap').forEach((a) =>
+    a.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      await viewSnapshot(Number(a.dataset.id));
+    }));
+}
 
 // ---------------------------- 发布快照 ----------------------------
 
